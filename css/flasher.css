@@ -7,14 +7,59 @@ body {
   height: 100vh;
 }
 
+body:has([v-cloak]):after {
+  content: '';
+  position: absolute;
+  top: calc(50% - 50px);
+  left: calc(50% - 50px);
+  width: 50px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  border: 8px solid #f0f0f0;
+  animation:
+    l20-1 0.8s infinite linear alternate,
+    l20-2 1.6s infinite linear;
+}
+@keyframes l20-1{
+   0%    {clip-path: polygon(50% 50%,0       0,  50%   0%,  50%    0%, 50%    0%, 50%    0%, 50%    0% )}
+   12.5% {clip-path: polygon(50% 50%,0       0,  50%   0%,  100%   0%, 100%   0%, 100%   0%, 100%   0% )}
+   25%   {clip-path: polygon(50% 50%,0       0,  50%   0%,  100%   0%, 100% 100%, 100% 100%, 100% 100% )}
+   50%   {clip-path: polygon(50% 50%,0       0,  50%   0%,  100%   0%, 100% 100%, 50%  100%, 0%   100% )}
+   62.5% {clip-path: polygon(50% 50%,100%    0, 100%   0%,  100%   0%, 100% 100%, 50%  100%, 0%   100% )}
+   75%   {clip-path: polygon(50% 50%,100% 100%, 100% 100%,  100% 100%, 100% 100%, 50%  100%, 0%   100% )}
+   100%  {clip-path: polygon(50% 50%,50%  100%,  50% 100%,   50% 100%,  50% 100%, 50%  100%, 0%   100% )}
+}
+@keyframes l20-2{
+  0%    {transform:scaleY(1)  rotate(0deg)}
+  49.99%{transform:scaleY(1)  rotate(135deg)}
+  50%   {transform:scaleY(-1) rotate(0deg)}
+  100%  {transform:scaleY(-1) rotate(-135deg)}
+}
+
 #app {
   flex-grow: 1;
 }
+
+#app h5.logo-top img {
+  height: 16px;
+  margin-top: -4px;
+}
+
+#app h5.logo-top span {
+  font-style: italic; font-weight: bold; line-height: 0.9
+}
+
 #app select {
   cursor: pointer
 }
+#app .tooltip:has(>.device) {
+  background: #f0f0f055;
+  width: auto;
+}
 #app img.device {
-  width: 300px;
+  width: 400px;
+  max-width: 400px;
+  max-height: 400px;
 }
 #app div.autoscroller {
   overflow: auto;
@@ -62,4 +107,23 @@ body {
 }
 #app .version div.field {
   min-width: 140px;
+  align-self: flex-start;
+}
+#app .version .pre {
+  padding-bottom: 10px;
+}
+#app img.icon {
+  height: 20px;
+}
+
+.flash-container {
+  padding-bottom: 150px;
+}
+
+.strong {
+  font-weight: 700;
+}
+
+.text-wrap {
+  text-wrap: auto;
 }

@@ -41,6 +41,10 @@ const commandReference  = {
   'get lon': 'Get the advertisement map longitude',
 };
 
+async function delay(milis) {
+  return await new Promise((resolve) => setTimeout(resolve, milis));
+}
+
 function getGithubReleases(roleType, files) {
   const versions = {};
   for(const [fileType, matchRE] of Object.entries(files)) {
@@ -78,7 +82,32 @@ function addGithubFiles() {
     }
   }
 
+  config.device = config.device.filter(device => device.firmware.some(firmware => Object.keys(firmware.version).length > 0 ));
+
   return config;
+}
+
+async function digestMessage(message) {
+  const msgUint8 = new TextEncoder().encode(message); // encode as (utf-8) Uint8Array
+  const hashBuffer = await window.crypto.subtle.digest("SHA-256", msgUint8); // hash the message
+  const hashArray = Array.from(new Uint8Array(hashBuffer)); // convert buffer to byte array
+
+  const hashHex = hashArray
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join(""); // convert bytes to hex string
+
+  return hashHex;
+}
+
+async function blobToBinaryString(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer())
+  let binString = '';
+
+  for (let i = 0; i < bytes.length; i++) {
+    binString += String.fromCharCode(bytes[i]);
+  }
+
+  return binString;
 }
 
 console.log(addGithubFiles());
@@ -87,16 +116,28 @@ function setup() {
   const consoleEditBox = ref();
   const consoleWindow = ref();
 
+  const deviceFilterText = ref('');
+
+  const snackbar = reactive({
+    text: '',
+    class: '',
+    icon: '',
+  });
+
   const selected = reactive({
     device: null,
     firmware: null,
     version: null,
     wipe: false,
+    nrfEraserFlashingPercent: 0,
+    nrfEraserFlashing: false,
     port: null,
   });
 
   const getRoleFwValue = (firmware, key) => {
-    return firmware[key] || config.role[firmware.role][key] || '';
+    const role = config.role[firmware.role] ?? {};
+
+    return firmware[key] ?? role[key] ?? '';
   }
 
   const getSelFwValue = (key) => {
@@ -108,8 +149,8 @@ function setup() {
   const flashing = reactive({
     supported: 'Serial' in window,
     instance: null,
-    active: false,
-    percentage: 0,
+    locked: false,
+    percent: 0,
     log: '',
     error: '',
     dfuComplete: false,
@@ -130,8 +171,20 @@ function setup() {
     writeLine(data) { flashing.log += data + '\n' }
   };
 
-  const refresh = () => {
-    location.reload();
+  const retry = async() => {
+    flashing.active = false;
+    flashing.log = '';
+    flashing.error = '';
+    flashing.dfuComplete = false;
+    flashing.percent = 0;
+    if(flashing.instance instanceof ESPLoader) {
+      await flashing.instance?.hr.reset();
+      await flashing.instance?.transport?.disconnect();
+    }
+  }
+
+  const close = () => {
+    location.reload()
   }
 
   const getFirmwarePath = (file) => {
@@ -172,14 +225,24 @@ function setup() {
     flashing.log = '';
     flashing.error = '';
     flashing.dfuComplete = false;
-    flashing.percentage = 0;
+    flashing.percent = 0;
     selected.firmware = null;
     selected.version = null;
     selected.wipe = false;
     selected.device = null;
+    selected.nrfEraserFlashingPercent = 0;
+    selected.nrfEraserFlashing = false;
     if(flashing.instance instanceof ESPLoader) {
       await flashing.instance?.hr.reset();
       await flashing.instance?.transport?.disconnect();
+    }
+    else if(flashing.instance instanceof Dfu) {
+      try {
+        flashing.instance.port.close()
+      }
+      catch(e) {
+        console.error(e);
+      }
     }
     flashing.instance = null;
   }
@@ -191,12 +254,12 @@ function setup() {
   const openSerialCon = async() => {
     const port = selected.port = await navigator.serial.requestPort();
     const serialConsole = serialCon.instance = new SerialConsole(port);
-    serialCon.content =  'Welcome to MeshCore serial console.\n'
-    serialCon.content += '-------------------------------------------------------------------------\n';
-    serialCon.content += 'WARNING: This console only works with *Repeater* and *Room server* roles.\n';
-    serialCon.content += '-------------------------------------------------------------------------\n';
-    serialCon.content += 'If you came here right after flashing, please restart your device.\n';
-    serialCon.content += 'Click on the cursor to get all supported commands.\n\n';
+
+    serialCon.content =  '-------------------------------------------------------------------------\n';
+    serialCon.content += 'Welcome to MeshCore serial console.\n'
+    serialCon.content += 'Click on the cursor to get all supported commands.\n';
+    serialCon.content += '-------------------------------------------------------------------------\n\n';
+
     serialConsole.onOutput = (text) => {
       serialCon.content += text;
     };
@@ -227,10 +290,19 @@ function setup() {
   const customFirmwareLoad = async(ev) => {
     const firmwareFile = ev.target.files[0];
     const type = firmwareFile.name.endsWith('.bin') ? 'esp32' : 'nrf52';
-    selected.device = {
+      selected.device = {
       name: 'Custom device',
       type,
     };
+    if(firmwareFile.name.endsWith('-merged.bin')) {
+      alert(
+        'You selected custom file that ends with "merged.bin".'+
+        'This will erase your flash! Proceed with caution.'+
+        'If you want just to update your firmware, please use non-merged bin.'
+      );
+
+      selected.wipe = true;
+    }
 
     selected.firmware = {
       icon: 'unknown_document',
@@ -244,54 +316,99 @@ function setup() {
     }
   }
 
+  const espReset = async(t) => {
+    await t.setRTS(true);
+    await delay(100)
+    await t.setRTS(false);
+  }
+
+  const nrfErase = async() => {
+    if(!(selected.device.type === 'nrf52' && selected.device.erase)) {
+      console.error('nRF erase called for non-nrf device or device.erase is not defined')
+      return;
+    }
+
+    const url = `${config.staticPath}/${selected.device.erase}`;
+
+    console.log('downloading: ' + url);
+    const resp = await fetch(url);
+    if(resp.status !== 200) {
+      alert(`Could not download the firmware file from the server, reported: HTTP ${resp.status}.\nPlease try again.`)
+      return;
+    }
+    const flashData = await resp.blob();
+
+    const port = selected.port = await navigator.serial.requestPort({});
+    const dfu = new Dfu(port);
+
+    try {
+      selected.nrfEraserFlashing = true;
+      await dfu.dfuUpdate(flashData, async (progress) => {
+        selected.nrfEraserFlashingPercent = progress;
+        if(progress === 100 && selected.nrfEraserFlashing) {
+          selected.nrfEraserFlashing = false;
+          selected.dfuComplete = false;
+          setTimeout(() => {
+            alert('Device erase firmware has been flashed and flash has been erased.\nYou can flash MeshCore now.');
+          }, 200);
+        }
+      }, 60000);
+
+    }
+    catch(e) {
+      alert(`nRF flashing erase firmware failed: ${e}.\nDid you put the device into DFU mode before attempting erasing?`);
+      selected.nrfEraserFlashing = false;
+      selected.nrfEraserFlashingPercent = 0;
+      return;
+    }
+  }
+
+  const canFlash = (device) => {
+    return device.type !== 'noflash'
+  }
+
   const flashDevice = async() => {
     const device = selected.device;
     const firmware = selected.firmware.version[selected.version];
-    let flashFile;
 
-    flashFile = firmware.files.find(f => f.type === 'flash');
-    if(!flashFile) {
+    const flashFiles = firmware.files.filter(f => f.type.startsWith('flash'));
+    if(!flashFiles[0]) {
       alert('Cannot find configuration for flash file! please report this to Discord.')
       flasherCleanup();
       return;
     }
 
-    console.log({flashFile, instanceFile: flashFile instanceof File});
+    console.log({flashFiles});
 
-    if(flashFile.file) {
-      flashFile = flashFile.file;
+    let flashData;
+    if(flashFiles[0].file) {
+      flashData = flashFiles[0].file;
     } else {
+      let flashFile;
+      if(device.type === 'esp32') {
+        flashFile = flashFiles.find(f => f.type === (selected.wipe ? 'flash-wipe' : 'flash-update'));
+      }
+      else {
+        flashFile = flashFiles[0];
+      }
+      console.log({flashFiles, flashFile});
+
       const url = getFirmwarePath(flashFile);
       console.log('downloading: ' + url);
       const resp = await fetch(url);
-      flashFile = await resp.blob();
+      if(resp.status !== 200) {
+        alert(`Could not download the firmware file from the server, reported: HTTP ${resp.status}.\nPlease try again.`)
+        return;
+      }
+
+      flashData = await resp.blob();
     }
 
     const port = selected.port = await navigator.serial.requestPort({});
 
     if(device.type === 'esp32') {
       let esploader;
-      let fileData;
       let transport;
-
-      try {
-        const reader = new FileReader();
-        fileData = await new Promise((resolve, reject) => {
-          reader.addEventListener('error', () => {
-            reader.abort();
-            reject(new DOMException('Problem parsing input file.'));
-          });
-
-          reader.addEventListener('load', () => resolve(reader.result));
-
-          reader.readAsBinaryString(flashFile);
-        });
-      }
-      catch(e) {
-        console.error(e);
-        flashing.error = `Cannot read flash file: ${e}`;
-        return;
-      }
 
       const flashOptions = {
         terminal: log,
@@ -304,18 +421,18 @@ function setup() {
         romBaudrate: 115200,
         enableTracing: false,
         fileArray: [{
-          data: fileData,
-          address: 0
+          data: await blobToBinaryString(flashData),
+          address: selected.wipe ? 0x00000 : 0x10000
         }],
         reportProgress: async (_, written, total) => {
-          flashing.percentage = (written / total) * 100;
+          flashing.percent = (written / total) * 100;
         },
       };
 
       try {
         flashing.active = true;
         transport = new Transport(port, true);
-        flashOptions.transport = transport
+        flashOptions.transport = transport;
         flashing.instance = esploader = new ESPLoader(flashOptions);
         esploader.hr = new HardReset(transport);
         await esploader.main();
@@ -330,44 +447,87 @@ function setup() {
 
       try {
         await esploader.writeFlash(flashOptions);
-        await esploader.after();
+        await delay(100);
+        await esploader.after('hard_reset');
+        await delay(100);
+        await espReset(transport);
+        await transport.disconnect();
       }
       catch(e) {
         console.error(e);
         flashing.error = `ESP32 flashing failed: ${e}`;
-        await esploader.hardReset();
+        await espReset(transport);
         await transport.disconnect();
         return;
       }
     }
     else if(device.type === 'nrf52') {
-      const dfu = flashing.instance = new Dfu(port, selected.wipe);
+      const dfu = flashing.instance = new Dfu(port);
 
       flashing.active = true;
 
       try {
-        await dfu.dfuUpdate(flashFile, async (progress) => {
-          flashing.percentage = progress;
-        });
+        await dfu.dfuUpdate(flashData, async (progress) => {
+          flashing.percent = progress;
+        }, 60000);
+
       }
       catch(e) {
         console.error(e);
-        flashing.error = `nRF flashing failed: ${e}`;
+        flashing.error = `nRF flashing failed: ${e}. Please reset the device and try again.`;
         return;
       }
     }
   };
 
+  const devices = computed(() => {
+    const classSortPrefix = (d) => d.class === 'ripple' ? '1' : '2';
+    const deviceGroups = {};
+
+    for(const cls of ['ripple', 'community']) {
+      const devices = config.device.toSorted(
+        (a, b) => (classSortPrefix(a) + a.maker + a.name).localeCompare(classSortPrefix(b) + b.maker + b.name)
+      ).filter(
+        d => d.class === cls && (deviceFilterText.value == '' || d.name.toLowerCase().includes(deviceFilterText.value?.toLowerCase()))
+      )
+      if(devices.length > 0) deviceGroups[cls] = devices;
+    }
+
+    return deviceGroups;
+  });
+
+  const showMessage = (text, icon, displayMs) => {
+    snackbar.class = 'active';
+    snackbar.text = text;
+    snackbar.icon = icon || '';
+
+    setTimeout(() => {
+      snackbar.icon = '';
+      snackbar.text = '';
+      snackbar.class = '';
+    }, displayMs || 2000);
+  }
+
+  const consoleMouseUp = (ev) => {
+    if(window.getSelection().toString().length) {
+      navigator.clipboard.writeText(window.getSelection().toString())
+      showMessage('text copied to clipboard');
+    }
+    consoleEditBox.value.focus();
+  }
+
   return {
-    consoleEditBox, consoleWindow,
-    config, selected, flashing,
+    snackbar,
+    consoleEditBox, consoleWindow, consoleMouseUp,
+    config, devices, selected, flashing, deviceFilterText,
     flashDevice, flasherCleanup, dfuMode,
     serialCon, closeSerialCon, openSerialCon,
     sendCommand, openSerialGUI,
-    refresh, commandReference,
+    retry, close, commandReference,
     stepBack,
     customFirmwareLoad, getFirmwarePath, getSelFwValue, getRoleFwValue,
-    firmwareHasData
+    firmwareHasData,
+    canFlash, nrfErase
   }
 }
 
